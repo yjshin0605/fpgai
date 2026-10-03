@@ -10,20 +10,25 @@
 // 올린다. PS 는 done 이 1인지 보고 17개를 읽으면, 읽는 도중에 값이 바뀌는 일이 없다.
 //
 // 주소 지도 (바이트 주소, 전부 32비트 읽기)
-//   0x00 STATUS   bit0 = done (새 결과 있음). PS 가 이 비트에 1을 쓰면 0으로 지워짐
-//                 bit1 = busy (계산 중)
+//   0x00 STATUS   bit0 done     새 결과 있음          (1을 써서 지움)
+//                 bit1 busy     계산 중               (읽기 전용)
+//                 bit2 ovr      안 읽어서 레코드 버림  (1을 써서 지움)
+//                 bit3 pair_err 짝이 안 맞아 버림      (1을 써서 지움)
 //   0x04 COUNT    지금까지 끝낸 레코드 수 (전원 켠 뒤 누적)
 //   0x50 NORM_SH  포락선 배율 (부호 있는 5비트). PS 가 레코드 시작 전에 써 둔다
 //                 = 14 - (그 레코드 최대 절댓값의 비트수 - 1)
 //                 읽기도 되며, 리셋하면 0 이 된다
 //   0x54 SKIP_FR  앞 몇 프레임을 궤적 계산에서 뺄지. 기본 0 (전부 사용).
 //                 DC 수렴 구간을 빼고 비교해 보려면 24 등을 쓴다
-//   0x08 ~ 0x4C   특징 레지스터 0 ~ 16 (sim_fixed.REGS 순서)
+//   0x08 ~ 0x48   특징 레지스터 0 ~ 16 (sim_fixed.REGS 순서)
 //                 0x08 n_active  0x0C n_pairs  0x10 n_zero   0x14 n_small  0x18 n_jump
 //                 0x1C mono      0x20 curv_sum 0x24 n_triples 0x28 rep_max  0x2C rep_lag
 //                 0x30 hmax      0x34 nocc     0x38 bw_sum   0x3C n_modes  0x40 occ
 //                 0x44 mean_q8   0x48 var_q8
 //   그 밖의 주소는 0을 돌려준다.
+//
+//   주의: NORM_SH 와 SKIP_FR 는 rstn 으로 0 이 된다. PS 는 리셋을 푼 뒤에 다시 써야 한다.
+//   주의: 리셋 직후 첫 레코드 결과는 버린다 (히스토그램 잔여가 남을 수 있음).
 //
 // PS 쪽 읽는 순서 (C 예시)
 //   while (!(Xil_In32(BASE + 0x00) & 1)) ;          // done 기다리기
@@ -84,7 +89,7 @@ module spec_feat_axi #(
     wire             feat_busy;
 
     // 인스턴스보다 먼저 선언해야 암묵적 1비트 선으로 잘리지 않는다
-    wire       pair_err;                    // 두 갈래의 짝이 안 맞아 한쪽을 버린 적이 있음
+    wire       pair_err_p;                  // 짝이 안 맞아 한쪽을 버림 (1클럭 펄스)
     reg signed [4:0] norm_sh;               // 0x50 에 쓴 값. 포락선 배율
     reg [7:0]        skip_frames;           // 0x54 에 쓴 값. 앞 몇 프레임을 뺄지 (기본 0)
 
@@ -96,7 +101,7 @@ module spec_feat_axi #(
         .dc_tdata(dc_tdata), .dc_tvalid(dc_tvalid), .dc_tready(dc_tready),
         .norm_sh(norm_sh),
         .regs_valid(regs_valid), .regs_flat(regs_flat), .busy(feat_busy),
-        .pair_err(pair_err)
+        .pair_err(pair_err_p)
     );
 
     // ------------------------------------------------------------------
@@ -107,6 +112,7 @@ module spec_feat_axi #(
     reg [31:0] rec_count;
     reg        done;
     reg        ovr;                         // 읽기 전에 새 결과가 와서 버린 적이 있음
+    reg        perr;                        // 짝이 안 맞아 버린 적이 있음 (펄스를 받아 유지)
 
     // 바이트 0 이 활성일 때만 쓴다. wstrb 를 안 보면 WSTRB=0000 인 쓰기에도 값이 바뀐다.
     wire       wr_hit   = s_axi_awready && s_axi_awvalid && s_axi_wready && s_axi_wvalid
@@ -114,6 +120,7 @@ module spec_feat_axi #(
     wire [5:0] wr_word   = s_axi_awaddr[ADDR_W-1:2];
     wire       clr_done  = wr_hit && (wr_word == 6'd0) && s_axi_wdata[0];
     wire       clr_ovr   = wr_hit && (wr_word == 6'd0) && s_axi_wdata[2];
+    wire       clr_perr  = wr_hit && (wr_word == 6'd0) && s_axi_wdata[3];
     wire       set_sh    = wr_hit && (wr_word == 6'd20);        // 0x50
     wire       set_skip  = wr_hit && (wr_word == 6'd21);        // 0x54
 
@@ -124,23 +131,29 @@ module spec_feat_axi #(
             rec_count <= 32'd0;
             done      <= 1'b0;
             ovr       <= 1'b0;
+            perr      <= 1'b0;
             norm_sh   <= 5'sd0;
             skip_frames <= 8'd0;
         end else begin
             // PS 가 아직 안 읽은 결과(done=1)가 있으면 덮어쓰지 않는다.
             // 덮어쓰면 PS 가 17개를 읽는 도중 두 레코드 값이 섞인다.
+            // 단, 같은 클럭에 PS 가 done 을 지우면 다 읽은 것이므로 새 결과를 받는다.
             if (regs_valid) begin
                 rec_count <= rec_count + 32'd1;
-                if (!done) begin
+                if (!done || clr_done) begin
                     for (k = 0; k < 17; k = k + 1) shadow[k] <= regs_flat[32*k +: 32];
-                    done <= 1'b1;
+                    done <= 1'b1;           // 새 결과가 있으므로 지우기보다 우선
                 end else begin
                     ovr <= 1'b1;            // 이번 레코드는 버렸다
                 end
-            end else begin
-                if (clr_done) done <= 1'b0;
-                if (clr_ovr)  ovr  <= 1'b0;
+            end else if (clr_done) begin
+                done <= 1'b0;
             end
+
+            if (pair_err_p) perr <= 1'b1;
+            else if (clr_perr) perr <= 1'b0;
+
+            if (clr_ovr && !(regs_valid && done && !clr_done)) ovr <= 1'b0;
             if (set_sh)
                 norm_sh <= s_axi_wdata[4:0];
             if (set_skip)
@@ -182,7 +195,7 @@ module spec_feat_axi #(
     reg  [31:0] rd_val;
 
     always @(*) begin
-        if (word == 6'd0)                        rd_val = {28'd0, pair_err, ovr, feat_busy, done};
+        if (word == 6'd0)                        rd_val = {28'd0, perr, ovr, feat_busy, done};
         else if (word == 6'd1)                   rd_val = rec_count;
         else if (word >= 6'd2 && word <= 6'd18)  rd_val = shadow[word - 6'd2];
         else if (word == 6'd20)                  rd_val = {{27{norm_sh[4]}}, norm_sh};
