@@ -2,9 +2,9 @@
 // ============================================================================
 // spec_feat_axi : spec_feat + AXI4-Lite 레지스터.  블록 디자인에 넣을 최상위 모듈.
 //
-//   FFT 출력 스트림 ┐
-//                   ├→ spec_feat → 특징 17개 ┐
-//   포락선 스트림   ┘                        └→ AXI-Lite 레지스터 → PS 가 읽음
+//   FFT 출력 스트림   ┐
+//                      ├→ spec_feat → 특징 17개 ┐
+//   dc_remove 출력 스트림┘                       └→ AXI-Lite 레지스터 → PS 가 읽음
 //
 // 레지스터가 새로 나오면 그림자 레지스터(shadow)에 한 번에 복사하고 STATUS 의 done 을 1로
 // 올린다. PS 는 done 이 1인지 보고 17개를 읽으면, 읽는 도중에 값이 바뀌는 일이 없다.
@@ -13,6 +13,11 @@
 //   0x00 STATUS   bit0 = done (새 결과 있음). PS 가 이 비트에 1을 쓰면 0으로 지워짐
 //                 bit1 = busy (계산 중)
 //   0x04 COUNT    지금까지 끝낸 레코드 수 (전원 켠 뒤 누적)
+//   0x50 NORM_SH  포락선 배율 (부호 있는 5비트). PS 가 레코드 시작 전에 써 둔다
+//                 = 14 - (그 레코드 최대 절댓값의 비트수 - 1)
+//                 읽기도 되며, 리셋하면 0 이 된다
+//   0x54 SKIP_FR  앞 몇 프레임을 궤적 계산에서 뺄지. 기본 0 (전부 사용).
+//                 DC 수렴 구간을 빼고 비교해 보려면 24 등을 쓴다
 //   0x08 ~ 0x4C   특징 레지스터 0 ~ 16 (sim_fixed.REGS 순서)
 //                 0x08 n_active  0x0C n_pairs  0x10 n_zero   0x14 n_small  0x18 n_jump
 //                 0x1C mono      0x20 curv_sum 0x24 n_triples 0x28 rep_max  0x2C rep_lag
@@ -32,13 +37,15 @@ module spec_feat_axi #(
     input  wire              clk,           // PL 클럭 (AXI 클럭과 같은 것을 쓰는 것을 권장)
     input  wire              rstn,          // 0 이면 신호 처리부 초기화
 
-    input  wire [31:0]       fft_tdata,     // {Im[15:0], Re[15:0]}, 프레임당 256칸
+    input  wire [63:0]       fft_tdata,     // fft_wrap 출력. [24:0] 실수부, [56:32] 허수부
+    input  wire [16:0]       fft_tuser,     // [7:0] 빈 번호, [8] 무효 표시, [16:9] 프레임 번호
+    input  wire              fft_tlast,     // 프레임의 마지막 빈
     input  wire              fft_tvalid,    // fft_tdata 가 유효함
     output wire              fft_tready,    // 항상 1
 
-    input  wire [16:0]       env_tdata,     // 전처리 포락선 한 샘플
-    input  wire              env_tvalid,    // env_tdata 가 유효함
-    output wire              env_tready,    // 항상 1
+    input  wire [35:0]       dc_tdata,      // dc_remove 출력 {Q[17:0], I[17:0]} (정규화 전)
+    input  wire              dc_tvalid,     // dc_tdata 가 유효함
+    output wire              dc_tready,     // 항상 1
 
     output wire              irq,           // done 과 같음. PS 인터럽트로 쓰고 싶을 때 연결
 
@@ -76,10 +83,17 @@ module spec_feat_axi #(
     wire [32*17-1:0] regs_flat;
     wire             feat_busy;
 
+    // 설정 레지스터 (인스턴스보다 먼저 선언해야 암묵적 1비트 선으로 잘리지 않는다)
+    reg signed [4:0] norm_sh;               // 0x50 에 쓴 값. 포락선 배율
+    reg [7:0]        skip_frames;           // 0x54 에 쓴 값. 앞 몇 프레임을 뺄지 (기본 0)
+
     spec_feat u_feat (
         .clk(clk), .rstn(rstn),
-        .fft_tdata(fft_tdata), .fft_tvalid(fft_tvalid), .fft_tready(fft_tready),
-        .env_tdata(env_tdata), .env_tvalid(env_tvalid), .env_tready(env_tready),
+        .fft_tdata(fft_tdata), .fft_tuser(fft_tuser), .fft_tlast(fft_tlast),
+        .fft_tvalid(fft_tvalid), .fft_tready(fft_tready),
+        .skip_frames(skip_frames),
+        .dc_tdata(dc_tdata), .dc_tvalid(dc_tvalid), .dc_tready(dc_tready),
+        .norm_sh(norm_sh),
         .regs_valid(regs_valid), .regs_flat(regs_flat), .busy(feat_busy)
     );
 
@@ -91,8 +105,11 @@ module spec_feat_axi #(
     reg [31:0] rec_count;
     reg        done;
 
-    wire       clr_done = s_axi_awready && s_axi_awvalid && s_axi_wready && s_axi_wvalid &&
-                          (s_axi_awaddr[ADDR_W-1:2] == 6'd0) && s_axi_wdata[0];
+    wire       wr_hit   = s_axi_awready && s_axi_awvalid && s_axi_wready && s_axi_wvalid;
+    wire [5:0] wr_word   = s_axi_awaddr[ADDR_W-1:2];
+    wire       clr_done  = wr_hit && (wr_word == 6'd0) && s_axi_wdata[0];
+    wire       set_sh    = wr_hit && (wr_word == 6'd20);        // 0x50
+    wire       set_skip  = wr_hit && (wr_word == 6'd21);        // 0x54
 
     integer k;
     always @(posedge clk) begin
@@ -100,6 +117,8 @@ module spec_feat_axi #(
             for (k = 0; k < 17; k = k + 1) shadow[k] <= 32'd0;
             rec_count <= 32'd0;
             done      <= 1'b0;
+            norm_sh   <= 5'sd0;
+            skip_frames <= 8'd0;
         end else begin
             if (regs_valid) begin
                 for (k = 0; k < 17; k = k + 1) shadow[k] <= regs_flat[32*k +: 32];
@@ -108,6 +127,10 @@ module spec_feat_axi #(
             end else if (clr_done) begin
                 done <= 1'b0;
             end
+            if (set_sh)
+                norm_sh <= s_axi_wdata[4:0];
+            if (set_skip)
+                skip_frames <= s_axi_wdata[7:0];
         end
     end
 
@@ -148,6 +171,8 @@ module spec_feat_axi #(
         if (word == 6'd0)                        rd_val = {30'd0, feat_busy, done};
         else if (word == 6'd1)                   rd_val = rec_count;
         else if (word >= 6'd2 && word <= 6'd18)  rd_val = shadow[word - 6'd2];
+        else if (word == 6'd20)                  rd_val = {{27{norm_sh[4]}}, norm_sh};
+        else if (word == 6'd21)                  rd_val = {24'd0, skip_frames};
         else                                     rd_val = 32'd0;
     end
 

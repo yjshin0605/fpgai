@@ -3,7 +3,9 @@
 // traj_rec : traj_frame 이 내보내는 프레임별 (p, m, c) 를 레코드(N_FR 프레임) 단위로 모아
 //            궤적 특징 레지스터 13개를 계산한다.  (freq_features.py 와 비트 단위로 같음)
 //
-//   활성 프레임 : m[k] >= (전체 m 최대) >> ACTIVE_SHIFT
+//   활성 프레임 : 앞단이 보낸 무효 표시가 0 이고, 프레임 번호가 skip_frames 이상인 프레임
+//                 (앞단 정규화가 프레임마다 세기를 맞추므로, 크기 비교로는 판정할 수 없다.
+//                  앞단은 정규화 전 RMS 와 peak hold 로 판정하므로 그 결과를 그대로 쓴다.)
 //   PASS  (프레임마다 6클럭)  : n_active, bw_sum, 피크 칸 히스토그램, 이웃 프레임 비교
 //                              (n_pairs, n_zero, n_small, n_jump, mono), 3프레임 비교
 //                              (curv_sum, n_triples). p 와 활성 여부를 레지스터 배열에 복사
@@ -18,7 +20,6 @@
 module traj_rec #(
     parameter MAG_W        = 16,
     parameter N_FR         = 127,       // 레코드당 프레임 수
-    parameter ACTIVE_SHIFT = 3,
     parameter SMALL_STEP   = 4,
     parameter REP_MIN      = 2,
     parameter REP_MAX      = 63
@@ -28,9 +29,13 @@ module traj_rec #(
 
     // traj_frame 출력을 그대로 연결
     input  wire             fr_valid,           // 프레임 값이 들어옴 (1클럭 펄스)
-    input  wire [7:0]       fr_p,               // 피크 칸 번호
+    input  wire [7:0]       fr_p,               // 피크 칸 번호 (fftshift 순서)
     input  wire [MAG_W-1:0] fr_m,               // 피크 크기
     input  wire [8:0]       fr_c,               // 순간 대역폭 칸 수
+    input  wire             fr_invalid,         // 앞단의 무효 표시 (1이면 잡음뿐인 프레임)
+    input  wire [7:0]       fr_frame,           // 프레임 번호 0~126
+    input  wire [7:0]       skip_frames,        // 이 번호보다 작은 프레임은 계산에서 뺀다
+                                                // 0이면 전부 사용. DC 수렴 구간을 뺄 때만 24 등으로
 
     output reg              regs_valid,         // 아래 13개가 새로 나옴 (1클럭 펄스)
     output reg  [31:0]      n_active, n_pairs, n_zero, n_small, n_jump, mono,
@@ -38,7 +43,7 @@ module traj_rec #(
     output wire             busy
 );
 
-    localparam RW = 9 + MAG_W + 8;              // 기록 한 칸 = {c, m, p}
+    localparam RW = 1 + 9 + MAG_W + 8;          // 기록 한 칸 = {act, c, m, p}
 
     // ==================================================================
     // 1. 프레임 기록 (쓰기 쪽)
@@ -46,30 +51,27 @@ module traj_rec #(
     reg [RW-1:0]    rec_mem [0:511];            // 주소 = {은행, 프레임 번호}
     reg             wbank;
     reg [7:0]       wcnt;
-    reg [MAG_W-1:0] mmax_w;
-    wire [MAG_W-1:0] mmax_n = (wcnt == 8'd0 || fr_m > mmax_w) ? fr_m : mmax_w;
+    // 활성 판정: 무효 표시가 0 이고, 프레임 번호가 skip_frames 이상
+    wire w_act = (!fr_invalid) && (fr_frame >= skip_frames);
 
     reg             start;
     reg             s_bank;
-    reg [MAG_W-1:0] s_mmax;
 
     always @(posedge clk) begin
         if (fr_valid)
-            rec_mem[{wbank, wcnt}] <= {fr_c, fr_m, fr_p};
+            rec_mem[{wbank, wcnt}] <= {w_act, fr_c, fr_m, fr_p};
     end
 
     always @(posedge clk) begin
         if (!rstn) begin
-            wbank <= 1'b0;  wcnt <= 8'd0;  mmax_w <= {MAG_W{1'b0}};
-            start <= 1'b0;  s_bank <= 1'b0;  s_mmax <= {MAG_W{1'b0}};
+            wbank <= 1'b0;  wcnt <= 8'd0;
+            start <= 1'b0;  s_bank <= 1'b0;
         end else begin
             start <= 1'b0;
             if (fr_valid) begin
-                mmax_w <= mmax_n;
                 if (wcnt == N_FR - 1) begin
                     start  <= 1'b1;
                     s_bank <= wbank;
-                    s_mmax <= mmax_n;
                     wbank  <= ~wbank;
                     wcnt   <= 8'd0;
                 end else begin
@@ -108,7 +110,6 @@ module traj_rec #(
     reg [2:0]       step;
     reg [8:0]       idx;                        // PASS: 프레임, SCANH: 칸
     reg             c_bank;
-    reg [MAG_W-1:0] c_thr;
 
     reg [7:0]       cur_p;
     reg [8:0]       cur_c;
@@ -130,8 +131,8 @@ module traj_rec #(
     // PASS 조합 신호 (rdata 도착 시점)
     wire [7:0]       rd_p   = rdata[7:0];
     wire [MAG_W-1:0] rd_m   = rdata[MAG_W+7:8];
-    wire [8:0]       rd_c   = rdata[RW-1:MAG_W+8];
-    wire             rd_act = (rd_m >= c_thr);
+    wire [8:0]       rd_c   = rdata[MAG_W+16:MAG_W+8];
+    wire             rd_act = rdata[RW-1];             // 저장해 둔 활성 비트
 
     // 이웃 프레임 비교 (step 4 에서 사용)
     wire signed [9:0]  d    = $signed({2'b00, cur_p}) - $signed({2'b00, p1});
@@ -167,7 +168,6 @@ module traj_rec #(
             S_IDLE: begin
                 if (start) begin
                     c_bank <= s_bank;
-                    c_thr  <= s_mmax >> ACTIVE_SHIFT;
                     r_active <= 0; r_pairs <= 0; r_zero <= 0; r_small <= 0; r_jump <= 0;
                     r_triples <= 0; r_mono <= 0; r_curv <= 0; r_bw <= 0;
                     p1 <= 0; p2 <= 0; a1 <= 1'b0; a2 <= 1'b0;
