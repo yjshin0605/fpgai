@@ -21,7 +21,7 @@
 // 버퍼는 은행 2개(핑퐁)라 다시 읽는 동안 다음 프레임을 받을 수 있다.
 // ============================================================================
 module traj_frame #(
-    parameter MAG_W    = 16,
+    parameter MAG_W    = 18,        // cordic_mag 출력 폭과 같아야 한다 (16으로 두면 피크가 랩함)
     parameter BW_SHIFT = 2
 )(
     input  wire             clk,

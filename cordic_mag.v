@@ -81,7 +81,7 @@ module cordic_mag #(
 
     // 출력: x >>> OUT_SHIFT 를 0 ~ 2^OUT_W-1 로 포화
     wire signed [INT_W-1:0] xf    = x[ITERS] >>> OUT_SHIFT;
-    wire signed [INT_W-1:0] max_v = {{(INT_W-OUT_W){1'b0}}, {OUT_W{1'b1}}};   // 65535
+    wire signed [INT_W-1:0] max_v = {{(INT_W-OUT_W){1'b0}}, {OUT_W{1'b1}}};   // OUT_W=18 이면 262,143
     wire                    ovf   = (xf > max_v);
 
     assign m_tdata  = xf[INT_W-1]             ? {OUT_W{1'b0}} :   // 음수면 0 (실제로는 생기지 않음)

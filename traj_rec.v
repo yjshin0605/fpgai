@@ -18,7 +18,6 @@
 // 걸쳐 들어오고, 기록 메모리가 은행 2개라 계산 중에도 다음 레코드를 받을 수 있다.
 // ============================================================================
 module traj_rec #(
-    parameter MAG_W        = 16,
     parameter N_FR         = 127,       // 레코드당 프레임 수
     parameter SMALL_STEP   = 4,
     parameter REP_MIN      = 2,
@@ -30,7 +29,6 @@ module traj_rec #(
     // traj_frame 출력을 그대로 연결
     input  wire             fr_valid,           // 프레임 값이 들어옴 (1클럭 펄스)
     input  wire [7:0]       fr_p,               // 피크 칸 번호 (fftshift 순서)
-    input  wire [MAG_W-1:0] fr_m,               // 피크 크기
     input  wire [8:0]       fr_c,               // 순간 대역폭 칸 수
     input  wire             fr_invalid,         // 앞단의 무효 표시 (1이면 잡음뿐인 프레임)
     input  wire [7:0]       fr_frame,           // 프레임 번호 0~126
@@ -43,7 +41,9 @@ module traj_rec #(
     output wire             busy
 );
 
-    localparam RW = 1 + 9 + MAG_W + 8;          // 기록 한 칸 = {act, c, m, p}
+    localparam RW = 1 + 9 + 8;                  // 기록 한 칸 = {act, c, p}
+                                                // 피크 크기(m)는 특징 13개 중 쓰는 곳이 없어 저장하지 않는다
+                                                // (활성 판정이 크기 비교에서 무효 표시로 바뀌면서 불필요해짐)
 
     // ==================================================================
     // 1. 프레임 기록 (쓰기 쪽)
@@ -59,7 +59,7 @@ module traj_rec #(
 
     always @(posedge clk) begin
         if (fr_valid)
-            rec_mem[{wbank, wcnt}] <= {w_act, fr_c, fr_m, fr_p};
+            rec_mem[{wbank, wcnt}] <= {w_act, fr_c, fr_p};
     end
 
     always @(posedge clk) begin
@@ -130,8 +130,7 @@ module traj_rec #(
 
     // PASS 조합 신호 (rdata 도착 시점)
     wire [7:0]       rd_p   = rdata[7:0];
-    wire [MAG_W-1:0] rd_m   = rdata[MAG_W+7:8];
-    wire [8:0]       rd_c   = rdata[MAG_W+16:MAG_W+8];
+    wire [8:0]       rd_c   = rdata[16:8];
     wire             rd_act = rdata[RW-1];             // 저장해 둔 활성 비트
 
     // 이웃 프레임 비교 (step 4 에서 사용)

@@ -83,7 +83,8 @@ module spec_feat_axi #(
     wire [32*17-1:0] regs_flat;
     wire             feat_busy;
 
-    // 설정 레지스터 (인스턴스보다 먼저 선언해야 암묵적 1비트 선으로 잘리지 않는다)
+    // 인스턴스보다 먼저 선언해야 암묵적 1비트 선으로 잘리지 않는다
+    wire       pair_err;                    // 두 갈래의 짝이 안 맞아 한쪽을 버린 적이 있음
     reg signed [4:0] norm_sh;               // 0x50 에 쓴 값. 포락선 배율
     reg [7:0]        skip_frames;           // 0x54 에 쓴 값. 앞 몇 프레임을 뺄지 (기본 0)
 
@@ -94,7 +95,8 @@ module spec_feat_axi #(
         .skip_frames(skip_frames),
         .dc_tdata(dc_tdata), .dc_tvalid(dc_tvalid), .dc_tready(dc_tready),
         .norm_sh(norm_sh),
-        .regs_valid(regs_valid), .regs_flat(regs_flat), .busy(feat_busy)
+        .regs_valid(regs_valid), .regs_flat(regs_flat), .busy(feat_busy),
+        .pair_err(pair_err)
     );
 
     // ------------------------------------------------------------------
@@ -104,10 +106,14 @@ module spec_feat_axi #(
     reg [31:0] shadow [0:16];
     reg [31:0] rec_count;
     reg        done;
+    reg        ovr;                         // 읽기 전에 새 결과가 와서 버린 적이 있음
 
-    wire       wr_hit   = s_axi_awready && s_axi_awvalid && s_axi_wready && s_axi_wvalid;
+    // 바이트 0 이 활성일 때만 쓴다. wstrb 를 안 보면 WSTRB=0000 인 쓰기에도 값이 바뀐다.
+    wire       wr_hit   = s_axi_awready && s_axi_awvalid && s_axi_wready && s_axi_wvalid
+                          && s_axi_wstrb[0];
     wire [5:0] wr_word   = s_axi_awaddr[ADDR_W-1:2];
     wire       clr_done  = wr_hit && (wr_word == 6'd0) && s_axi_wdata[0];
+    wire       clr_ovr   = wr_hit && (wr_word == 6'd0) && s_axi_wdata[2];
     wire       set_sh    = wr_hit && (wr_word == 6'd20);        // 0x50
     wire       set_skip  = wr_hit && (wr_word == 6'd21);        // 0x54
 
@@ -117,15 +123,23 @@ module spec_feat_axi #(
             for (k = 0; k < 17; k = k + 1) shadow[k] <= 32'd0;
             rec_count <= 32'd0;
             done      <= 1'b0;
+            ovr       <= 1'b0;
             norm_sh   <= 5'sd0;
             skip_frames <= 8'd0;
         end else begin
+            // PS 가 아직 안 읽은 결과(done=1)가 있으면 덮어쓰지 않는다.
+            // 덮어쓰면 PS 가 17개를 읽는 도중 두 레코드 값이 섞인다.
             if (regs_valid) begin
-                for (k = 0; k < 17; k = k + 1) shadow[k] <= regs_flat[32*k +: 32];
                 rec_count <= rec_count + 32'd1;
-                done      <= 1'b1;
-            end else if (clr_done) begin
-                done <= 1'b0;
+                if (!done) begin
+                    for (k = 0; k < 17; k = k + 1) shadow[k] <= regs_flat[32*k +: 32];
+                    done <= 1'b1;
+                end else begin
+                    ovr <= 1'b1;            // 이번 레코드는 버렸다
+                end
+            end else begin
+                if (clr_done) done <= 1'b0;
+                if (clr_ovr)  ovr  <= 1'b0;
             end
             if (set_sh)
                 norm_sh <= s_axi_wdata[4:0];
@@ -168,7 +182,7 @@ module spec_feat_axi #(
     reg  [31:0] rd_val;
 
     always @(*) begin
-        if (word == 6'd0)                        rd_val = {30'd0, feat_busy, done};
+        if (word == 6'd0)                        rd_val = {28'd0, pair_err, ovr, feat_busy, done};
         else if (word == 6'd1)                   rd_val = rec_count;
         else if (word >= 6'd2 && word <= 6'd18)  rd_val = shadow[word - 6'd2];
         else if (word == 6'd20)                  rd_val = {{27{norm_sh[4]}}, norm_sh};
