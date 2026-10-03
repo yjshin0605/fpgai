@@ -1,0 +1,65 @@
+=== numeric ===
+PASS env_detect 800 vectors / all 32 shifts
+/tmp/tmpty570_82/tb.v:2406: $finish called at 40030000 (1ps)
+PASS cordic_mag 206 signed and saturation vectors
+/tmp/tmpty570_82/tb.v:624: $finish called at 37110000 (1ps)
+PASS traj_frame 25 full frames: tie/last/zero/256 width/random
+/tmp/tmpty570_82/tb.v:6506: $finish called at 96780000 (1ps)
+PASS traj_rec 24 records / all 13 features
+/tmp/tmpty570_82/tb.v:3414: $finish called at 1834830000 (1ps)
+PASS env_hist 5 full records / 4 features / max variance
+/tmp/tmpty570_82/tb.v:81951: $finish called at 819430000 (1ps)
+PASS numeric checks: 1413
+
+
+=== review ===
+RESULT phase=1 index=1 active=127 mean_q8=256
+PASS single record, natural-order peak, valid gaps, 17-stage tags
+WSTRB_ZERO norm_sh=0 expected=0
+WSTRB_OTHER_BYTE skip_frames=0 expected=0
+PAIR_ERROR time=773745000
+RESULT phase=2 index=1 active=127 mean_q8=256
+RESULT phase=2 index=2 active=127 mean_q8=768
+CONTINUOUS results=2 expected=3; final_mean=256
+review_current/tb_review.v:44: $finish called at 1511340000 (1ps)
+
+
+=== reset ===
+RESET_AFTER_PARTIAL_PASS n_active=0 hmax=2 expected_hmax=0
+review_current/tb_reset.v:13: $finish called at 8266000 (1ps)
+
+
+=== axi ===
+EARLY_BVALID: no write handshake completed before this edge
+EARLY_RVALID: no read handshake completed before this edge
+AXI norm_sh=4
+PASS shadow preserved first=111, incoming=222 dropped, ovr=1, count=2
+review_current/tb_axi_diag.v:33: $finish called at 170000 (1ps)
+
+
+=== smoke ===
+[1] 무효 표시 없음, 4프레임마다 켜짐
+    n_active=127 n_pairs=126 n_zero=0 n_small=4 n_jump=122
+    hmax=32 nocc=15 bw_sum=18412 | n_modes=2 occ=2 mean=256 var=768
+[2] 꺼진 프레임에 무효 표시
+    n_active=32 n_pairs=0 n_zero=0 n_small=0 n_jump=0
+    hmax=32 nocc=1 bw_sum=96 | n_modes=2 occ=2 mean=256 var=768
+[3] skip_frames = 24
+    n_active=26 n_pairs=0 n_zero=0 n_small=0 n_jump=0
+    hmax=26 nocc=1 bw_sum=78 | n_modes=2 occ=2 mean=256 var=768
+[4] norm_sh = 4 (포락선 16배)
+    n_active=32 n_pairs=0 n_zero=0 n_small=0 n_jump=0
+    hmax=32 nocc=1 bw_sum=96 | n_modes=2 occ=2 mean=2752 var=34992
+[5] 레코드 두 개 연달아
+    n_active=16 n_pairs=0 n_zero=0 n_small=0 n_jump=0
+    hmax=16 nocc=1 bw_sum=48 | n_modes=2 occ=2 mean=1888 var=20412
+[6] rec A(4프레임마다) -> rec B(8프레임마다), 각각 읽기
+[7] WSTRB 확인
+[8] hist 누적 도중 리셋 -> 전부 무효 레코드
+    (1차) n_active=0 hmax=7
+    n_active=0 n_pairs=0 n_zero=0 n_small=0 n_jump=0
+    hmax=0 nocc=0 bw_sum=0 | n_modes=1 occ=1 mean=0 var=0
+==================================================
+ [SMOKE PASS] 동작 확인 완료 (값의 정확성은 새 골든으로 검증 필요)
+==================================================
+review_current/tb_spec_feat_smoke.v:364: $finish called at 4863665000 (1ps)
